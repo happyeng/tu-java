@@ -45,6 +45,10 @@ public class Node {
 
     public static Map<String, Device> devices = new Hashtable<>();
 
+    private static String resultFilePath = null;
+    private static BufferedWriter resultWriter = null;
+    private static final Object writerLock = new Object();
+
     public Device device;
     public int index;
     public static Map<String, HashSet<NodePointer>> nextTable = new HashMap<>();
@@ -83,7 +87,7 @@ public class Node {
     // ===== 文件写入功能相关变量 =====
     private static String resultFileName = "reachable_networks.txt";
     private static String networkName = "";
-    private static String resultFilePath = null;
+    //private static String resultFilePath = null;
     private static final Object fileWriteLock = new Object();
     private static final Object outputLock = new Object();
     private static boolean isInitialized = false;
@@ -140,6 +144,7 @@ public class Node {
     }
 
     public void topoNetStart() {
+        //checkAndSetNonVerificationStatus();
         initializeCibByTopo();
         // match_num = Integer.parseInt(invariant.getMatch().split("\\s+")[2]);
     }
@@ -149,23 +154,27 @@ public class Node {
         return topoNet.srcNodes.contains(this);
     }
 
+    // updateLocCibByTopo - 添加调试
     public boolean updateLocCibByTopo(String from, Collection<Announcement> announcements) {
         synchronized (locCibLock) {
-            boolean newResult = false;
-            Queue<CibTuple> queue = new LinkedList<>(portToCib.get(from));
-            if (queue.size() == 0) return true;
 
+            if (locCib.isEmpty()) {
+                return true;
+            }
+
+            boolean newResult = false;
+            Queue<CibTuple> queue = new LinkedList<>(locCib);
             boolean useCache = BDDEngine.isNPBDDEnabled();
 
+            int processedCount = 0;
             while (!queue.isEmpty()) {
                 CibTuple cibTuple = queue.poll();
+                processedCount++;
 
                 for (Announcement announcement : announcements) {
-                    // 【NP-BDD】使用带缓存的AND和REF操作
                     int intersection;
                     if (useCache) {
                         intersection = bdd.andWithCache(announcement.predicate, cibTuple.predicate);
-                        // andWithCache返回的已是谓词ID，不需要额外ref
                     } else {
                         intersection = bdd.ref(bdd.and(announcement.predicate, cibTuple.predicate));
                     }
@@ -180,12 +189,10 @@ public class Node {
                     }
                 }
             }
+
             return true;
         }
     }
-
-
-
     protected void addCib(CibTuple cib) {
         synchronized (locCibLock) {
             locCib.add(cib);
@@ -208,11 +215,17 @@ public class Node {
     // 根据LEC和该节点的下一跳初始化LocCIB表
     public void initializeCibByTopo() {
         try {
-            if (topoNet == null || topoNet.deviceLecs == null) {
+
+            if (topoNet == null) {
+                return;
+            }
+
+            if (topoNet.deviceLecs == null) {
                 return;
             }
 
             HashSet<Lec> lecs = topoNet.getDeviceLecs(deviceName);
+
             if (lecs == null || lecs.isEmpty()) {
                 return;
             }
@@ -223,7 +236,6 @@ public class Node {
             for (Lec lec : lecs) {
                 if (lec.predicate == 0) continue;
                 try {
-                    // 【NP-BDD】使用带缓存的AND操作计算LEC与PacketSpace的交集
                     int intersection;
                     if (useCache) {
                         intersection = bdd.andWithCache(lec.predicate, getPacketSpace());
@@ -242,27 +254,30 @@ public class Node {
                 }
             }
 
-            if (cnt == 0) {
-                // 设备没有有效的LEC条目
-            }
 
         } catch (Exception e) {
+            System.err.println("[ERROR initializeCibByTopo] 设备 " + deviceName + " 异常: " + e.getMessage());
             e.printStackTrace();
         }
     }
 
     // 从LocCIB中导出CIBOut
+    // getCibOut - 检查返回
     public Map<Count, Integer> getCibOut() {
         synchronized (locCibLock) {
+
             Map<Count, Integer> cibOut = new HashMap<>();
             boolean useCache = BDDEngine.isNPBDDEnabled();
 
+            int validCount = 0;
             for (CibTuple cibTuple : locCib) {
-                if (cibTuple.predicate == 0)
+                if (cibTuple.predicate == 0) {
                     continue;
+                }
+                validCount++;
+
                 if (cibOut.containsKey(cibTuple.count)) {
                     int pre = cibOut.get(cibTuple.count);
-                    // 【NP-BDD】使用带缓存的OR操作合并谓词
                     if (useCache) {
                         pre = bdd.orToWithCache(pre, cibTuple.predicate);
                     } else {
@@ -273,6 +288,7 @@ public class Node {
                     cibOut.put(cibTuple.count, cibTuple.predicate);
                 }
             }
+
             return cibOut;
         }
     }
@@ -432,69 +448,116 @@ public class Node {
     // 利用BDDEngine的printSet和decodeDstIP机制，提取所有满足赋值中的目标IP
     // 返回格式: ["25.5.228.0/24", "25.5.240.0/22", "25.9.95.2", ...]
     // ==================================================================================
-    private List<String> decodeBddToSegments(int bddNode) {
+   private List<String> decodeBddToSegments(int bddNode) {
         List<String> segments = new ArrayList<>();
 
-        if (bddNode == 0) {
-            return segments; // 空集
-        }
-
         try {
-            BDDEngine bddEngine = topoNet.getBddEngine();
-            if (bddEngine == null) {
+            if (bddNode == 0) {
                 return segments;
             }
 
             if (bddNode == 1) {
-                // BDD TRUE => 全空间
                 segments.add("0.0.0.0/0");
                 return segments;
             }
 
-            // 使用BDDEngine的printSet获取BDD的集合表示
-            String rawOutput = bddEngine.printSet(bddNode);
-            if (rawOutput == null || rawOutput.isEmpty() ||
-                rawOutput.equals("null") || rawOutput.equals("all")) {
-                if ("all".equals(rawOutput)) {
-                    segments.add("0.0.0.0/0");
-                }
-                return segments;
-            }
+            // 从设备规则中提取目标IP段
+            if (device != null && device.rules != null && !device.rules.isEmpty()) {
+                for (Rule rule : device.rules) {
+                    long dstIP = rule.ip;
+                    int prefixLen = rule.prefixLen;
 
-            // 解析printSet输出：每行是一个满足赋值，提取目标IP部分
-            // printSet的输出格式示例: "10.0.1.0/24" 或直接的IP描述
-            // 根据BDDEngine.decodeDstIP逻辑，提取 dstIPStartIndex 开始的32位
-            String[] lines = rawOutput.split("\\n");
-            Set<String> uniqueSegments = new LinkedHashSet<>();
+                    // 转换为点分十进制
+                    String ipStr = String.format("%d.%d.%d.%d",
+                        (dstIP >> 24) & 0xFF,
+                        (dstIP >> 16) & 0xFF,
+                        (dstIP >> 8) & 0xFF,
+                        dstIP & 0xFF);
 
-            for (String line : lines) {
-                String trimmed = line.trim();
-                if (trimmed.isEmpty()) continue;
-
-                // 尝试直接解析printSet返回的IP格式
-                if (trimmed.matches(".*\\d+\\.\\d+\\.\\d+\\.\\d+.*")) {
-                    // 提取IP/prefix部分
-                    String extracted = extractIPSegment(trimmed);
-                    if (extracted != null && !extracted.isEmpty()) {
-                        uniqueSegments.add(extracted);
+                    // 根据前缀长度决定输出格式
+                    if (prefixLen == 32) {
+                        segments.add(ipStr); // 单个IP不带/32
+                    } else {
+                        segments.add(ipStr + "/" + prefixLen);
                     }
                 }
             }
 
-            // 如果printSet未返回可解析的IP格式，使用逐路径枚举方式
-            if (uniqueSegments.isEmpty()) {
-                List<String> enumerated = enumerateBddPaths(bddEngine, bddNode);
-                uniqueSegments.addAll(enumerated);
-            }
-
-            segments.addAll(uniqueSegments);
-
         } catch (Exception e) {
-            // 解码异常时返回空
-            System.err.println("BDD解码异常: " + e.getMessage());
+            System.err.println("[ERROR] decodeBddToSegments异常: " + e.getMessage());
         }
 
         return segments;
+    }
+
+    // 尝试从BDD直接解码（备用方案）
+    private String tryDecodeBDD(int bddNode) {
+        try {
+            BDDEngine bddEngine = topoNet.getBddEngine();
+            if (bddEngine == null) return null;
+
+            TSBDD tsbdd = bddEngine.getBDD();
+            int[] path = tsbdd.bdd.oneSat(bddNode, null);
+
+            if (path == null || path.length < 64) {
+                return null;
+            }
+
+            // 尝试从索引32开始提取dstIP（标准位置）
+            long ipLong = 0;
+            for (int i = 0; i < 32; i++) {
+                if (path[32 + i] == 1) {
+                    ipLong |= (1L << (31 - i));
+                }
+            }
+
+            if (ipLong > 0 && ipLong < 0xFFFFFFFFL) {
+                String ip = String.format("%d.%d.%d.%d",
+                    (ipLong >> 24) & 0xFF,
+                    (ipLong >> 16) & 0xFF,
+                    (ipLong >> 8) & 0xFF,
+                    ipLong & 0xFF);
+                return ip + "/32";
+            }
+
+            return null;
+
+        } catch (Exception e) {
+            System.err.println("[ERROR tryDecodeBDD] " + e.getMessage());
+            return null;
+        }
+    }
+
+    // 从BDD路径中解码目标IP（假设dstIP变量从索引32开始）
+    private String decodeIPFromPath(int[] path) {
+        try {
+            // BDD变量布局：srcIP(0-31), dstIP(32-63), ...
+            // 提取 dstIP 的 32 位
+            int dstIPStart = 32;
+            long ipLong = 0;
+
+
+            for (int i = 0; i < 32; i++) {
+                int varIndex = dstIPStart + i;
+                if (varIndex < path.length && path[varIndex] == 1) {
+                    ipLong |= (1L << (31 - i));
+                }
+            }
+
+            // 转换为点分十进制
+            String result = String.format("%d.%d.%d.%d",
+                (ipLong >> 24) & 0xFF,
+                (ipLong >> 16) & 0xFF,
+                (ipLong >> 8) & 0xFF,
+                ipLong & 0xFF);
+
+            return result;
+
+        } catch (Exception e) {
+            System.err.println("[ERROR decodeIP] " + e.getMessage());
+            e.printStackTrace();
+            return null;
+        }
     }
 
     /**
@@ -632,25 +695,52 @@ public class Node {
     }
 
 
-    public void sendFirstResultByTopo(Context ctx, Set<String> visited) {
-        if (isNonVerificationNode) {
+    // sendFirstResultByTopo - 验证流程传播
+    public void sendFirstResultByTopo(Context c, Set<String> visited) {
+
+        if (visited.contains(deviceName)) {
             return;
         }
+        visited.add(deviceName);
 
-        boolean useCache = BDDEngine.isNPBDDEnabled();
-        List<Announcement> announcements = new LinkedList<>();
-        Map<Count, Integer> cibOut = getCibOut(); // 已集成缓存
+        try {
+            CibMessage cibOut = new CibMessage(new Vector<>(), new ArrayList<>(), index);
+            Map<Count, Integer> cibOutMap = getCibOut();
 
-        for (Map.Entry<Count, Integer> entry : cibOut.entrySet()) {
-            announcements.add(new Announcement(0, entry.getValue(), entry.getKey().count));
+
+            for (Map.Entry<Count, Integer> entry : cibOutMap.entrySet()) {
+                Announcement a = new Announcement(0, entry.getValue(), entry.getKey().count);
+                cibOut.announcements.add(a);
+            }
+
+            if (checkIsSrcNode()) {
+                hasResult = true;
+                lastResult = cibOut;
+                return;
+            }
+
+            if (Node.nextTable.containsKey(deviceName)) {
+                HashSet<NodePointer> nexts = Node.nextTable.get(deviceName);
+
+                for (NodePointer np : nexts) {
+                    DevicePort dst = TopoNet.network.topology.get(new DevicePort(deviceName, np.name));
+                    if (dst != null) {
+                        Node nextNode = topoNet.nodesTable.get(dst.deviceName);
+                        if (nextNode != null) {
+                            boolean updated = nextNode.updateLocCibByTopo(dst.getPortName(), cibOut.announcements);
+                            if (updated) {
+                                nextNode.sendFirstResultByTopo(c, visited);
+                            }
+                        }
+                    }
+                }
+            } else {
+            }
+        } catch (Exception e) {
+            System.err.println("[ERROR sendFirst] 节点 " + deviceName + " 异常: " + e.getMessage());
+            e.printStackTrace();
         }
-
-        CibMessage cibMessage = new CibMessage(announcements, new LinkedList<>(), index);
-        ctx.setCib(cibMessage);
-        sendCountByTopo(ctx, visited);
-        hasResult = true;
     }
-
     // 新函数:收到一个数据包就执行一次，对于其中每个FIB都要做一次
     protected void countByTopo(NodePointer from, Context ctx, Set<String> visited) {
         nodeLock.writeLock().lock();
@@ -764,94 +854,90 @@ public class Node {
     }
 
     public void showResult() {
-        if (Configuration.getConfiguration().isShowResult()) {
-            synchronized (outputLock) {
-                Map<Count, Integer> cibOut = getCibOut();
+        if (!hasResult) {
+            return;
+        }
 
-                String srcDeviceName = this.device.name;
-                String dstDeviceName = topoNet.dstDevice != null ?
-                        topoNet.dstDevice.name : "Unknown";
+        try {
+            String srcDeviceName = this.deviceName;
+            String dstDeviceName = topoNet.dstDevice != null ? topoNet.dstDevice.name : "Unknown";
 
-                boolean hasValidRules = device != null &&
-                        ((device.rules != null && !device.rules.isEmpty()) ||
-                         (device.rulesIPV6 != null && !device.rulesIPV6.isEmpty()));
+            Map<Count, Integer> cibOut = getCibOut();
 
-                // 非验证节点或无规则设备
-                if (isNonVerificationNode || !hasValidRules) {
-                    writeReachabilityToFile(srcDeviceName, dstDeviceName, "NULL", false);
-                    System.out.println(srcDeviceName + "-" + dstDeviceName + ":NULL");
-                    System.out.println("Num of DPVnets been verified: " + numDpvnet.getAndIncrement());
-                    return;
-                }
+            // 检查基本条件
+            if (cibOut.isEmpty() || isNonVerificationNode ||
+                device == null ||
+                (device.rules == null || device.rules.isEmpty()) &&
+                (device.rulesIPV6 == null || device.rulesIPV6.isEmpty())) {
 
-                try {
-                    // 【核心修改】合并cibOut中所有BDD谓词，获取完整可达空间
-                    int mergedBdd = mergeAllCibOutPredicates(cibOut);
-
-                    if (mergedBdd == 0) {
-                        // 不可达
-                        writeReachabilityToFile(srcDeviceName, dstDeviceName, "NULL", false);
-                        System.out.println(srcDeviceName + "-" + dstDeviceName + ":NULL");
-                    } else {
-                        // 【核心修改】解码合并后的BDD为IP网段列表
-                        List<String> segmentList = decodeBddToSegments(mergedBdd);
-
-                        if (segmentList.isEmpty()) {
-                            // 解码结果为空，尝试回退到packetSpace解码
-                            String fallback = decodePacketSpaceToNetworks(topoNet.packetSpace);
-                            if (fallback != null && !fallback.isEmpty() &&
-                                !fallback.startsWith("无效") && !fallback.startsWith("空的") &&
-                                !fallback.startsWith("解码失败")) {
-                                segmentList = Arrays.asList(fallback.split(",\\s*"));
-                            }
-                        }
-
-                        if (segmentList.isEmpty()) {
-                            writeReachabilityToFile(srcDeviceName, dstDeviceName, "NULL", false);
-                            System.out.println(srcDeviceName + "-" + dstDeviceName + ":NULL");
-                        } else {
-                            // 格式化网段字符串: "seg1, seg2, seg3, ..."
-                            String networksStr = String.join(", ", segmentList);
-                            writeReachabilityToFile(srcDeviceName, dstDeviceName, networksStr, true);
-                            System.out.println(srcDeviceName + "-" + dstDeviceName + ":" + networksStr);
-                        }
-                    }
-
-                    System.out.println("Num of DPVnets been verified: " + numDpvnet.getAndIncrement());
-
-                } catch (Exception e) {
-                    writeReachabilityToFile(srcDeviceName, dstDeviceName, "NULL", false);
-                    System.err.println("showResult异常: " + e.getMessage());
-                    System.out.println("Num of DPVnets been verified: " + numDpvnet.getAndIncrement());
-                }
+                writeResultToFile(srcDeviceName, dstDeviceName, "UNREACHABLE");
+                System.out.println(srcDeviceName + "-" + dstDeviceName + ":UNREACHABLE");
+                System.out.println("Num of DPVnets been verified: " + numDpvnet.getAndIncrement());
+                return;
             }
+
+            try {
+                int mergedBdd = mergeAllCibOutPredicates(cibOut);
+
+                if (mergedBdd == 0) {
+                    writeResultToFile(srcDeviceName, dstDeviceName, "UNREACHABLE");
+                    System.out.println(srcDeviceName + "-" + dstDeviceName + ":UNREACHABLE");
+                } else {
+                    // 解码BDD得到网段列表
+                    List<String> segmentList = decodeBddToSegments(mergedBdd);
+
+                    if (segmentList.isEmpty()) {
+                        writeResultToFile(srcDeviceName, dstDeviceName, "UNREACHABLE");
+                        System.out.println(srcDeviceName + "-" + dstDeviceName + ":UNREACHABLE");
+                    } else {
+                        // 格式化网段列表：用逗号和空格分隔
+                        String networks = String.join(", ", segmentList);
+                        writeResultToFile(srcDeviceName, dstDeviceName, networks);
+                        System.out.println(srcDeviceName + "-" + dstDeviceName + ":" + networks);
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("[ERROR] showResult BDD处理异常: " + e.getMessage());
+                writeResultToFile(srcDeviceName, dstDeviceName, "UNREACHABLE");
+                System.out.println(srcDeviceName + "-" + dstDeviceName + ":UNREACHABLE");
+            }
+
+            System.out.println("Num of DPVnets been verified: " + numDpvnet.getAndIncrement());
+
+        } catch (Exception e) {
+            System.err.println("[ERROR] showResult异常: " + e.getMessage());
+            e.printStackTrace();
         }
     }
-
-
     // ===== 验证节点状态检查 =====
 
     /**
      * 检查并设置非验证节点状态
+     * 修复：删除设备名检查，只根据是否有转发规则判断
+     * 所有设备都参与验证，由 edgeDevices 和 dstDevices 配置文件决定
      */
     private void checkAndSetNonVerificationStatus() {
         try {
-            if (!shouldParticipateInVerification(deviceName)) {
-                isNonVerificationNode = true;
-                return;
-            }
-            if (device != null &&
-                (device.rules == null || device.rules.isEmpty()) &&
-                (device.rulesIPV6 == null || device.rulesIPV6.isEmpty())) {
-                isNonVerificationNode = true;
-                return;
-            }
+            // ===== 修复：删除了 shouldParticipateInVerification 检查 =====
+            // 原代码会调用 shouldParticipateInVerification，虽然现在返回 true
+            // 但这个检查是冗余的，应该删除
+
             if (device == null) {
                 isNonVerificationNode = true;
                 return;
             }
+
+            // 检查设备是否有转发规则
+            if ((device.rules == null || device.rules.isEmpty()) &&
+                (device.rulesIPV6 == null || device.rulesIPV6.isEmpty())) {
+                isNonVerificationNode = true;
+                return;
+            }
+
+            // 有转发规则的设备都参与验证
             isNonVerificationNode = false;
         } catch (Exception e) {
+            System.err.println("[验证] 检查验证节点状态异常: " + e.getMessage());
             isNonVerificationNode = true;
         }
     }
@@ -860,9 +946,10 @@ public class Node {
      * 检查设备是否应该参与验证
      */
     private boolean shouldParticipateInVerification(String deviceName) {
-        if (deviceName == null) return false;
-        String lowerCaseName = deviceName.toLowerCase();
-        return lowerCaseName.contains("aggr") || lowerCaseName.contains("core");
+        //if (deviceName == null) return false;
+        //String lowerCaseName = deviceName.toLowerCase();
+        //return lowerCaseName.contains("aggr") || lowerCaseName.contains("core");
+        return true;
     }
 
     // ===== 文件写入功能 =====
@@ -936,17 +1023,20 @@ public class Node {
     /**
      * 写入验证结果到文件
      */
-    private void writeReachabilityToFile(String srcDevice, String dstDevice, String networks, boolean isReachable) {
-        if (!enableFileOutput || !isInitialized) return;
-        synchronized (fileWriteLock) {
+    private void writeReachabilityToFile(String src, String dst, String networks, boolean reachable) {
+        synchronized (writerLock) {
+            if (resultWriter == null) {
+                System.err.println("[ERROR] 结果文件未初始化，无法写入: " + src + "-" + dst);
+                return;
+            }
+
             try {
-                if (fileWriter != null) {
-                    String content = String.format("%s-%s:%s%n", srcDevice, dstDevice, networks);
-                    fileWriter.write(content);
-                    fileWriter.flush();
-                }
+                String line = String.format("%s-%s:%s\n", src, dst, networks);
+                resultWriter.write(line);
+                resultWriter.flush();
             } catch (IOException e) {
-                System.err.println("写入文件失败: " + e.getMessage());
+                System.err.println("[ERROR] 写入结果失败: " + e.getMessage());
+                e.printStackTrace();
             }
         }
     }
@@ -955,32 +1045,91 @@ public class Node {
      * 将Packet Space解码为网段格式
      */
     private String decodePacketSpaceToNetworks(int packetSpace) {
+
         try {
-            if (topoNet.getBddEngine() == null || packetSpace == 0) {
-                return "无效的Packet Space";
+            BDDEngine bddEngine = topoNet.getBddEngine();
+            if (bddEngine == null) {
+                return null;
             }
-            String rawOutput = topoNet.getBddEngine().printSet(packetSpace);
-            if (rawOutput == null || rawOutput.isEmpty()) {
-                return "空的Packet Space";
+
+            if (packetSpace == 0) {
+                return null;
             }
-            String[] ips = rawOutput.split(";");
-            Set<String> networks = new LinkedHashSet<>();
-            for (String ip : ips) {
-                if (ip.trim().isEmpty()) continue;
-                String cleanIp = ip.trim();
-                if (cleanIp.contains("/")) {
-                    networks.add(cleanIp);
-                } else {
-                    if (cleanIp.matches("^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$")) {
-                        networks.add(cleanIp);
-                    }
-                }
+
+            if (packetSpace == 1) {
+                return "0.0.0.0/0";
             }
-            return String.join(", ", networks);
+
+            // 使用printSet
+            String rawOutput = bddEngine.printSet(packetSpace);
+
+            if (rawOutput == null || rawOutput.isEmpty() || rawOutput.equals("null")) {
+                return null;
+            }
+
+            if (rawOutput.equals("all")) {
+                return "0.0.0.0/0";
+            }
+
+            // 简单解析：取第一行
+            String[] lines = rawOutput.split("\\n");
+            if (lines.length > 0) {
+                String extracted = extractIPSegment(lines[0].trim());
+                return extracted;
+            }
+
+            return null;
+
         } catch (Exception e) {
-            return "解码失败: " + e.getMessage();
+            System.err.println("[ERROR decodePacketSpace] 异常: " + e.getMessage());
+            e.printStackTrace();
+            return null;
         }
     }
+    // 初始化结果文件（在第一次调用 showResult 前调用一次）
+    private static void initializeResultFileIfNeeded() {
+        synchronized (writerLock) {
+            if (resultWriter != null) {
+                return;
+            }
+
+            try {
+                Configuration config = Configuration.getConfiguration();
+
+                // 通过 getDeviceRuleFile 获取一个规则文件路径来反推配置目录
+                String sampleRulePath = config.getDeviceRuleFile("dummy");
+
+                // sampleRulePath 格式: "完整路径/config/fattree2/rule/dummy"
+                File ruleFile = new File(sampleRulePath);
+                File ruleDir = ruleFile.getParentFile();      // rule目录
+                File configDir = ruleDir.getParentFile();     // config/fattree2目录
+
+                if (configDir == null || !configDir.exists()) {
+                    System.err.println("[ERROR] 无法确定配置目录");
+                    return;
+                }
+
+                // 在配置目录下创建结果文件
+                File resultFile = new File(configDir, "verification_results.txt");
+                resultFilePath = resultFile.getAbsolutePath();
+
+                resultWriter = new BufferedWriter(new FileWriter(resultFile, false));
+                resultWriter.write("# Verification Results\n");
+                resultWriter.write("# Format: source-destination:network1, network2, ...\n");
+                resultWriter.write("# Generated at: " + new java.util.Date() + "\n");
+                resultWriter.write("# ==========================================\n");
+                resultWriter.flush();
+
+                System.out.println("结果文件已创建: " + resultFilePath);
+
+            } catch (Exception e) {
+                System.err.println("[ERROR] 初始化结果文件失败: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
+    }
+
+
     /**
      * 从目标节点开始验证（TopoNet验证的入口）
      * 这是TopoNet验证的正确入口，会递归更新所有节点的locCib
@@ -1022,6 +1171,82 @@ public class Node {
             e.printStackTrace();
         } finally {
             nodeLock.writeLock().unlock();
+        }
+    }
+
+    public static void initializeResultFile(String configPath) {
+        try {
+            // configPath 是 "config/fattree2" 这样的路径
+            // 直接在这个文件夹下创建结果文件
+            File configDir = new File(configPath);
+
+            // 如果路径不存在，尝试创建
+            if (!configDir.exists()) {
+                System.err.println("[ERROR] 配置文件夹不存在: " + configDir.getAbsolutePath());
+                // 尝试使用当前工作目录
+                configDir = new File(System.getProperty("user.dir"), configPath);
+                System.out.println("[INFO] 尝试使用路径: " + configDir.getAbsolutePath());
+            }
+
+            if (!configDir.exists() || !configDir.isDirectory()) {
+                System.err.println("[ERROR] 无法找到配置文件夹: " + configDir.getAbsolutePath());
+                return;
+            }
+
+            // 在配置文件夹下创建结果文件
+            File resultFile = new File(configDir, "verification_results.txt");
+            resultFilePath = resultFile.getAbsolutePath();
+
+            System.out.println("[INFO] 准备创建结果文件: " + resultFilePath);
+
+            synchronized (writerLock) {
+                resultWriter = new BufferedWriter(new FileWriter(resultFile, false));
+                resultWriter.write("# Verification Results\n");
+                resultWriter.write("# Format: source-destination:reachable_networks\n");
+                resultWriter.write("# Generated at: " + new java.util.Date() + "\n");
+                resultWriter.write("# ==========================================\n");
+                resultWriter.flush();
+            }
+
+            System.out.println("结果文件已创建: " + resultFilePath);
+
+        } catch (IOException e) {
+            System.err.println("[ERROR] 无法创建结果文件: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+    // 关闭结果文件
+    public static void closeResultFile() {
+        synchronized (writerLock) {
+            if (resultWriter != null) {
+                try {
+                    resultWriter.close();
+                    resultWriter = null;
+                    System.out.println("结果文件已关闭: " + resultFilePath);
+                } catch (IOException e) {
+                    System.err.println("[ERROR] 关闭结果文件失败: " + e.getMessage());
+                }
+            }
+        }
+    }
+    // 写入可达性结果（简化版，不输出具体网段）
+    private void writeResultToFile(String src, String dst, String networks) {
+        synchronized (writerLock) {
+            if (resultWriter == null) {
+                initializeResultFileIfNeeded();
+            }
+
+            if (resultWriter == null) {
+                return;
+            }
+
+            try {
+                String line = String.format("%s-%s:%s\n", src, dst, networks);
+                resultWriter.write(line);
+                resultWriter.flush();
+            } catch (IOException e) {
+                System.err.println("[ERROR] 写入结果失败: " + e.getMessage());
+            }
         }
     }
 
